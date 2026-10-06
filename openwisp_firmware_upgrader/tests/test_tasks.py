@@ -2,6 +2,7 @@ from unittest import mock
 
 from celery.exceptions import SoftTimeLimitExceeded
 from django.test import TransactionTestCase
+from kombu.exceptions import OperationalError
 
 from openwisp_utils.tests import capture_any_output
 
@@ -46,6 +47,30 @@ class TestTasks(TestUpgraderMixin, TransactionTestCase):
             self.assertEqual(BatchUpgradeOperation.objects.count(), 1)
             batch = BatchUpgradeOperation.objects.first()
             self.assertEqual(batch.status, "failed")
+
+    def test_batch_upgrade_fails_child_when_task_dispatch_fails(self):
+        env = self._create_upgrade_env()
+        batch = BatchUpgradeOperation.objects.create(build=env["build2"])
+        with mock.patch(
+            "openwisp_firmware_upgrader.base.models.upgrade_firmware.delay",
+            side_effect=[None, OperationalError("broker unavailable")],
+        ) as mocked_publish:
+            tasks.batch_upgrade_operation.run(batch_id=batch.pk, firmwareless=False)
+
+        self.assertEqual(mocked_publish.call_count, 2)
+        first_id = mocked_publish.call_args_list[0].args[0]
+        second_id = mocked_publish.call_args_list[1].args[0]
+        first = UpgradeOperation.objects.get(pk=first_id)
+        second = UpgradeOperation.objects.get(pk=second_id)
+        batch.refresh_from_db()
+        self.assertEqual(first.status, "in-progress")
+        self.assertEqual(second.status, "failed")
+        self.assertEqual(batch.status, "in-progress")
+
+        first.status = "success"
+        first.save()
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, "failed")
 
     @mock.patch(_mock_upgrade, return_value=True)
     @mock.patch("logging.Logger.warning")

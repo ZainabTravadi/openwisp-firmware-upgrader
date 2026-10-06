@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
+from kombu.exceptions import OperationalError
 from private_storage.fields import PrivateFileField
 
 from openwisp_controller.connection.exceptions import NoWorkingDeviceConnectionError
@@ -467,9 +468,17 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
             operation.batch = batch
         operation.full_clean()
         operation.save()
+
         # launch ``upgrade_firmware`` in the background (celery)
         # once changes are committed to the database
-        transaction.on_commit(partial(upgrade_firmware.delay, operation.pk))
+        def dispatch_upgrade():
+            try:
+                upgrade_firmware.delay(operation.pk)
+            except OperationalError:
+                operation.status = "failed"
+                operation.save()
+
+        transaction.on_commit(dispatch_upgrade)
         return operation
 
     @classmethod
